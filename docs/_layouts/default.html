@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  
+  {% seo %}
+
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/syntax.css' | relative_url }}">
+  <script src="{{ '/assets/js/main.js' | relative_url }}" defer></script>
+
+</head>
+
+<body>
+
+  <header class="site-header">
+    <a href="{{ '/' | relative_url }}" class="site-title">{{ site.title | escape }}</a>
+    <div class="header-controls">
+        <button id="theme-toggle" class="theme-toggle" title="Toggle theme">🌓</button>
+        <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle sidebar">☰</button>
+    </div>
+  </header>
+
+  <div class="container">
+    <aside class="sidebar">
+      <nav>
+        <ul class="sidebar-nav">
+          <li><a href="#architecture-overview">Architecture Overview</a></li>
+          <li><a href="#prerequisites">Prerequisites</a></li>
+          <li><a href="#step-1-prepare-the-nodes">Step 1: Prepare Nodes</a></li>
+          <li><a href="#step-2-install-kubernetes-cluster">Step 2: Install Kubernetes</a></li>
+          <li><a href="#step-3-deploy-rook-ceph">Step 3: Deploy Rook-Ceph</a></li>
+          <li><a href="#step-4-create-and-use-storage">Step 4: Use Storage</a></li>
+          <li><a href="#troubleshooting">Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main class="main-content">
+      <div class="content-wrapper">
+        {{ content }}
+
+        <footer class="site-footer">
+          <p>&copy; {{ 'now' | date: "%Y" }} {{ site.author.name | default: "Your Name" }}. Licensed under Apache 2.0.</p>
+        </footer>
+      </div>
+    </main>
+  </div>
+
+</body>
+
+</html>

@@ -1,0 +1,25 @@
+title: "Kubernetes High-Availability On-Premise with Rook-Ceph"
+author:
+  name: "Miguel Saca"
+description: "A comprehensive guide to deploying a high-availability Kubernetes cluster on-premise using Rook and Ceph for distributed storage."
+url: "https://miguel-saca.github.io"
+baseurl: "/k8s-ha-on-prem-with-rook-ceph"
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# Markdown Processing
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    css_class: 'highlight'
+
+# Exclude from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/
