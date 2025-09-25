@@ -38,48 +38,62 @@ description: A comprehensive guide to deploying a high-availability Kubernetes c
 ---
 
 ## Architecture Overview
-This guide details how to build a high-availability (HA) Kubernetes cluster with a robust, distributed storage backend using **Rook** and **Ceph**.
+This guide details how to build a production-grade high-availability (HA) Kubernetes cluster on-premises with a robust, distributed storage backend using **Rook** and **Ceph**.
 
-- **Kubernetes**: The container orchestrator. We will set up a multi-node cluster with one control plane and multiple worker nodes.
-- **Rook**: An open-source cloud-native storage orchestrator for Kubernetes. Rook automates the deployment, configuration, scaling, and management of storage services.
+The Kubernetes cluster runs on a **private, isolated network**, and a dedicated **Edge Gateway VM** in the **DMZ** terminates the public traffic and forwards it to an **internal VIP**.
+
+**Seven VMs with clear roles:**
+- **1× Edge Gateway (DMZ)** → public IPs, **HAProxy** (TCP/80, TCP/443) → forwards to internal VIP.
+- **3× Control‑Plane (Masters)** → HA **kube‑apiserver** via **HAProxy + Keepalived** with an **internal API VIP**.
+- **3× Workers** → schedule application workloads and host **Rook‑Ceph OSDs**.
+
+- **Kubernetes**: The container orchestrator. We will set up a multi-node HA cluster with three control plane nodes and three worker nodes.
 - **Ceph**: A highly scalable, software-defined storage solution that provides block, object, and file storage. Rook will manage Ceph to provide persistent storage for our applications.
 
 ---
 
 ## Prerequisites
-- **3 or more physical or virtual machines** running a compatible Linux distribution (e.g., Ubuntu 20.04/22.04, CentOS/RHEL 8+).
+- **7 physical or virtual machines** running a compatible Linux distribution (e.g., Ubuntu 20.04/22.04, CentOS/RHEL 8+).
 - **Static IPs** for all nodes.
 - **Root or `sudo` access** on all nodes.
 
 | Node Role       | Qty | vCPU | RAM   | OS Disk (Root) | Data Disks (Ceph OSDs)     | Rationale                                                                 |
 |-----------------|-----:|-----:|------:|----------------|-----------------------------|----------------------------------------------------------------------------|
-| **Control-Plane**| 1+  | 2+   | 4 GB+ | 100 GB SSD     | N/A                         | Handles etcd I/O and control-plane workloads with headroom.               |
-| **Worker**      | 2+  | 4+   | 16 GB+| 100 GB SSD     | 1× 500 GB SSD/NVMe (raw)    | Runs apps and high-performance Ceph OSDs on raw devices.                   |
+| **Edge Gateway**| 1   | 2+   | 4 GB  | 50 GB SSD      | N/A                         | Lightweight HAProxy acting as external L4 gateway.                         |
+| **Master**      | 3   | 4+   | 16 GB | 100 GB SSD     | N/A                         | Handles etcd I/O and control‑plane workloads with headroom.               |
+| **Worker**      | 3   | 4+   | 16 GB | 100 GB SSD     | 1× 500 GB SSD/NVMe (raw)    | Runs apps and high‑performance Ceph OSDs on raw devices.                   |
 
 > **Note:** OSD devices must be **raw/unformatted**; Rook will prepare them.
 
 ---
-
-## Step 1: Prepare the Nodes
-Execute these commands on **all nodes** (control-plane and workers).
+## Step 1: Universal Preparation of Cluster Nodes (6 VMs)
+Execute these commands on **all 6 Kubernetes nodes** (3 masters and 3 workers). The Edge Gateway is configured separately.
 
 ### Network Configuration
 Ensure all nodes can communicate with each other over the network. A clear addressing plan is crucial.
 
 | Node Role                 | Hostname        | IP Address(es)                                  | Network  |
 |---------------------------|-----------------|--------------------------------------------------|----------|
-| **Control-Plane**              | `k8s-master`  | `10.10.1.101`                                  | Private  |
+| **Edge Gateway**          | `k8s-edge-gw`   | `200.x.x.10` (Public) / `10.10.1.99` (Priv) | DMZ/Priv |
+| **Master 1**              | `k8s-master-1`  | `10.10.1.101`                                  | Private  |
+| **Master 2**              | `k8s-master-2`  | `10.10.1.102`                                  | Private  |
+| **Master 3**              | `k8s-master-3`  | `10.10.1.103`                                  | Private  |
 | **Worker 1**              | `k8s-worker-1`  | `10.10.1.111`                                  | Private  |
 | **Worker 2**              | `k8s-worker-2`  | `10.10.1.112`                                  | Private  |
+| **Worker 3**              | `k8s-worker-3`  | `10.10.1.113`                                  | Private  |
 | **Internal API VIP**      | —               | `10.10.1.120`                                  | Private  |
 | **Services VIP (MetalLB)**| —               | `10.10.1.240` (example)                        | Private  |
 
 Update `/etc/hosts` on all nodes for local DNS resolution:
 ```bash
 cat <<EOF | sudo tee -a /etc/hosts
-10.10.1.101  k8s-master
+10.10.1.99   k8s-edge-gw
+10.10.1.101  k8s-master-1
+10.10.1.102  k8s-master-2
+10.10.1.103  k8s-master-3
 10.10.1.111  k8s-worker-1
 10.10.1.112  k8s-worker-2
+10.10.1.113  k8s-worker-3
 EOF
 ```
 
@@ -139,10 +153,38 @@ sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 ```
 
-### Initialize the Control Plane Node
-On the **control-plane node only**:
+### Initialize the HA Control Plane
+Before initializing the cluster, you need to set up **Internal API Load Balancing** with **HAProxy + Keepalived** on all three masters to provide the **internal API VIP `10.10.1.120`**.
+
+**Install packages on all three masters:**
 ```bash
-sudo kubeadm init --pod-network-cidr=192.168.0.0/16 --control-plane-endpoint=k8s-master
+sudo apt-get update && sudo apt-get install -y haproxy keepalived
+```
+
+**Configure HAProxy on all masters** (`/etc/haproxy/haproxy.cfg`):
+```haproxy
+frontend kubernetes-api
+    bind 10.10.1.120:6443
+    mode tcp
+    default_backend kubernetes-masters
+backend kubernetes-masters
+    mode tcp
+    balance roundrobin
+    server k8s-master-1 10.10.1.101:6443 check
+    server k8s-master-2 10.10.1.102:6443 check
+    server k8s-master-3 10.10.1.103:6443 check
+```
+
+**Configure Keepalived**: configure `k8s-master-1` as `MASTER` (priority **150**), the others as `BACKUP` (priority **100**).
+
+**Enable services on all masters:**
+```bash
+sudo systemctl enable --now haproxy keepalived
+```
+
+**Initialize on `k8s-master-1`** with the internal API VIP:
+```bash
+sudo kubeadm init --control-plane-endpoint "10.10.1.120:6443" --upload-certs --pod-network-cidr=192.168.0.0/16
 ```
 After initialization, run these commands to configure `kubectl`:
 ```bash
@@ -150,22 +192,27 @@ mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 ```
-Save the `kubeadm join` command that is outputted. You will need it to join the worker nodes.
+Save both the `kubeadm join` commands that are outputted - one for additional control planes and one for worker nodes.
 
-### Join Worker Nodes
-On **each worker node**, run the `kubeadm join` command you saved from the previous step. It will look something like this:
+### Join Additional Masters & Workers
+**Join additional masters** (`k8s-master-2` and `k8s-master-3`) using the control-plane join command:
 ```bash
-sudo kubeadm join k8s-master:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
+sudo kubeadm join 10.10.1.120:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash> --control-plane --certificate-key <certificate-key>
 ```
 
-### Install a CNI Plugin (Calico)
-On the **control-plane node**, install the Calico network plugin:
+**Join worker nodes** using the worker join command:
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+sudo kubeadm join 10.10.1.120:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
 ```
-Wait a few moments, then verify that all nodes are in the `Ready` state:
+
+### Install Flannel CNI
+On any **control-plane node**, install the Flannel network plugin:
 ```bash
-kubectl get nodes
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+```
+Wait a few moments, then verify that all 6 nodes (3 control planes, 3 workers) are in the `Ready` state:
+```bash
+kubectl get nodes -o wide
 ```
 
 ---
@@ -195,11 +242,18 @@ Now, define and create the Ceph cluster. Edit `cluster.yaml` to match your envir
 Example `storage` section in `cluster.yaml`:
 ```yaml
 storage:
-  useAllNodes: true
+  useAllNodes: false
   useAllDevices: false
-  devices:
-    - name: "sdb"
-    - name: "nvme0n1"
+  nodes:
+    - name: "k8s-worker-1"
+      devices:
+        - name: "sdb" # Replace with the name of your disk
+    - name: "k8s-worker-2"
+      devices:
+        - name: "sdb" # Replace with the name of your disk
+    - name: "k8s-worker-3"
+      devices:
+        - name: "sdb" # Replace with the name of your disk
 ```
 Once configured, create the cluster:
 ```bash
@@ -209,26 +263,63 @@ kubectl apply -f cluster.yaml
 ### Verify the Ceph Cluster
 It will take a few minutes for the Ceph cluster to be provisioned. Check the status of the pods in the `rook-ceph` namespace. You should see pods for `rook-ceph-mon`, `rook-ceph-mgr`, `rook-ceph-osd`, and others.
 ```bash
-kubectl -n rook-ceph get pods
+kubectl -n rook-ceph get pods --watch
 ```
-Once all pods are running, you can check the Ceph status by exec-ing into the `rook-ceph-tools` pod:
+Wait for the `rook-ceph-mon`, `rook-ceph-mgr`, and `rook-ceph-osd-prepare` pods to complete their work and see 3 `rook-ceph-osd-X` pods in the `Running` state.
+
+**Deploy toolbox and verify storage backend:**
 ```bash
-kubectl -n rook-ceph exec -it $(kubectl -n rook-ceph get pod -l "app=rook-ceph-tools" -o jsonpath='{.items[0].metadata.name}') -- ceph status
+kubectl apply -f toolbox.yaml
+kubectl -n rook-ceph exec -it $(kubectl -n rook-ceph get pod -l "app=rook-ceph-tools" -o jsonpath='{.items[0].metadata.name}') -- bash
 ```
+
+**Health checks inside the toolbox:**
+- **General Health:** `ceph status` (should show `health: HEALTH_OK`)
+- **OSDs:** `ceph osd tree` (should show 3 OSDs, all `up` and `in`, each associated with a different worker node)
 
 ---
 
 ## Step 4: Create and Use Storage
 
 ### Create a CephBlockPool and StorageClass
-First, create a `CephBlockPool`, which defines a logical pool for block storage. Then, create a `StorageClass` that uses this pool.
+Create `CephBlockPool` and `StorageClass` for dynamic provisioning:
 
-Navigate to `rook/deploy/examples/csi/rbd` and apply the `storageclass.yaml`:
-```bash
-cd ../csi/rbd # From the examples directory
-kubectl apply -f storageclass.yaml
+```yaml
+# blockpool.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+---
+# storageclass.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
 ```
-This creates a `StorageClass` named `rook-ceph-block`.
+
+Apply and confirm:
+```bash
+kubectl apply -f blockpool.yaml
+kubectl apply -f storageclass.yaml
+kubectl get sc # Should show the new StorageClass 'rook-ceph-block'
+```
 
 ### Create a PersistentVolumeClaim (PVC)
 Now, you can request storage by creating a `PersistentVolumeClaim`.
